@@ -1,0 +1,236 @@
+#include <Arduino.h>
+#include <arduinoFFT.h>
+#include <driver/i2s.h>
+#include <TensorFlowLite_ESP32.h>
+#include "libmfcc.h"
+#include "inference.h"
+
+#define SAMPLE_BUFFER_SIZE 512
+#define SAMPLE_RATE 8000
+
+#define I2S_MIC_SERIAL_CLOCK GPIO_NUM_32
+#define I2S_MIC_LEFT_RIGHT_CLOCK 25
+#define I2S_MIC_SERIAL_DATA GPIO_NUM_33
+#define SAMPLES 512
+
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+
+float MFCC_Buffer[40][13];
+float Features_Buffer[40][49];
+float ZCR_Buffer[40];
+float RMS_Buffer[40];
+float Contrast_Buffer[40][7];
+float Flatness_Buffer[40];
+
+int frames_collected = 0;
+bool buffer_ready = false;
+
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+};
+
+i2s_pin_config_t i2s_mic_pins = {
+    .bck_io_num = I2S_MIC_SERIAL_CLOCK,
+    .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SERIAL_DATA
+};
+
+int32_t raw_samples[SAMPLE_BUFFER_SIZE];
+ArduinoFFT<double> FFT;
+
+// Band edges for spectral contrast: np.linspace(0, 257, 8, dtype=int)
+// Python uses freq_bins = n_fft//2 + 1 = 257 (rfft output size)
+static const int BAND_EDGES[8] = {0, 36, 73, 110, 146, 183, 220, 257};
+
+static void computeDeltas(float src[40][13], float dst[40][13]) {
+    // Matches librosa.feature.delta default (width=9, N=4)
+    // delta[t] = sum_{n=1}^{4} n*(x[t+n]-x[t-n]) / 60, edge-padded
+    const int N = 4;
+    const float denom = 60.0f; // 2 * (1+4+9+16)
+    for (int t = 0; t < 40; t++) {
+        for (int c = 0; c < 13; c++) {
+            float num = 0;
+            for (int n = 1; n <= N; n++) {
+                int tp = (t + n < 40) ? (t + n) : 39;
+                int tm = (t - n >= 0)  ? (t - n) : 0;
+                num += n * (src[tp][c] - src[tm][c]);
+            }
+            dst[t][c] = num / denom;
+        }
+    }
+}
+
+// ZCR = number of sign changes / (n - 1), matching Python compute_zcr
+static float computeZCR(int32_t* samples, int n) {
+    int crossings = 0;
+    for (int i = 1; i < n; i++) {
+        if ((samples[i] >= 0) != (samples[i-1] >= 0)) crossings++;
+    }
+    return (float)crossings / (float)(n - 1);
+}
+
+// RMS energy of normalized samples, matching Python compute_rms
+static float computeRMS(int32_t* samples, int n) {
+    float sum = 0;
+    for (int i = 0; i < n; i++) {
+        float s = (float)samples[i] / (float)INT32_MAX;
+        sum += s * s;
+    }
+    return sqrtf(sum / n);
+}
+
+// Spectral contrast: mean(top 20%) - mean(bottom 20%) per sub-band
+// Matches Python: k = max(1, len(band)//5); mean(sort(band)[-k:]) - mean(sort(band)[:k])
+static void computeSpectralContrast(double* magnitudes, int n_bins, float* out) {
+    for (int b = 0; b < 7; b++) {
+        int start = BAND_EDGES[b];
+        int end = BAND_EDGES[b + 1];
+        int len = end - start;
+
+        // Copy band into local buffer and insertion-sort it
+        float band[60];
+        for (int i = 0; i < len; i++) band[i] = (float)magnitudes[start + i];
+        for (int i = 1; i < len; i++) {
+            float key = band[i];
+            int j = i - 1;
+            while (j >= 0 && band[j] > key) { band[j+1] = band[j]; j--; }
+            band[j+1] = key;
+        }
+
+        int k = len / 5;
+        if (k < 1) k = 1;
+
+        float bot = 0, top = 0;
+        for (int i = 0; i < k; i++)         bot += band[i];
+        for (int i = len - k; i < len; i++) top += band[i];
+        out[b] = (top / k) - (bot / k);
+    }
+}
+
+// Spectral flatness: geometric mean / arithmetic mean, matching Python compute_spectral_flatness
+static float computeSpectralFlatness(double* magnitudes, int n_bins) {
+    float log_sum = 0, sum = 0;
+    for (int k = 0; k < n_bins; k++) {
+        float v = (float)magnitudes[k];
+        log_sum += logf(v + 1e-10f);
+        sum += v;
+    }
+    float geo_mean = expf(log_sum / n_bins);
+    float arith_mean = sum / n_bins;
+    return geo_mean / (arith_mean + 1e-10f);
+}
+
+static float delta_buf[40][13];
+static float delta2_buf[40][13];
+
+// Assembles all 49 features per frame:
+// MFCC (0-12) + delta (13-25) + delta2 (26-38) + ZCR (39) + RMS (40) + contrast (41-47) + flatness (48)
+static void buildFeaturesBuffer() {
+    computeDeltas(MFCC_Buffer, delta_buf);
+    computeDeltas(delta_buf, delta2_buf);
+    for (int t = 0; t < 40; t++) {
+        for (int c = 0; c < 13; c++) {
+            Features_Buffer[t][c]      = MFCC_Buffer[t][c];
+            Features_Buffer[t][c + 13] = delta_buf[t][c];
+            Features_Buffer[t][c + 26] = delta2_buf[t][c];
+        }
+        Features_Buffer[t][39] = ZCR_Buffer[t];
+        Features_Buffer[t][40] = RMS_Buffer[t];
+        for (int b = 0; b < 7; b++) {
+            Features_Buffer[t][41 + b] = Contrast_Buffer[t][b];
+        }
+        Features_Buffer[t][48] = Flatness_Buffer[t];
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("== BOOT ==");
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+    Serial.println("I2S ready");
+    delay(500);
+    Serial.println("Loading model...");
+    setupModel();
+    Serial.println("Setup done");
+}
+
+void loop() {
+    // --- Read I2S ---
+    size_t bytes_read = 0;
+    i2s_read(I2S_NUM_0, raw_samples, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
+    int N = bytes_read / sizeof(int32_t);
+
+    // --- ZCR and RMS from raw samples (before FFT overwrites vReal) ---
+    float zcr = computeZCR(raw_samples, N);
+    float rms = computeRMS(raw_samples, N);
+
+    // --- Normalize & DC remove ---
+    double mean = 0;
+    for (int i = 0; i < N; i++) {
+        vReal[i] = (double)raw_samples[i] / (double)INT32_MAX;
+        mean += vReal[i];
+    }
+    mean /= N;
+    for (int i = 0; i < N; i++) {
+        vReal[i] -= mean;
+        vImag[i] = 0.0;
+    }
+
+    // --- FFT ---
+    FFT.windowing(vReal, N, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+    FFT.compute(vReal, vImag, N, FFT_FORWARD);
+    FFT.complexToMagnitude(vReal, vImag, N);
+
+    // --- Spectral contrast and flatness from FFT magnitudes ---
+    // Use N/2+1 bins to match Python's rfft output size (257 bins for N=512)
+    float contrast[7];
+    computeSpectralContrast(vReal, N / 2 + 1, contrast);
+    float flatness = computeSpectralFlatness(vReal, N / 2 + 1);
+
+    // --- MFCC ---
+    double MFCC_Coeff[13];
+    for (int i = 0; i < 13; i++) {
+        MFCC_Coeff[i] = GetCoefficient(vReal, SAMPLE_RATE, 26, N / 2, i);
+    }
+
+    // --- Accumulate / slide frames ---
+    if (!buffer_ready) {
+        for (int j = 0; j < 13; j++) MFCC_Buffer[frames_collected][j] = MFCC_Coeff[j];
+        ZCR_Buffer[frames_collected] = zcr;
+        RMS_Buffer[frames_collected] = rms;
+        for (int b = 0; b < 7; b++) Contrast_Buffer[frames_collected][b] = contrast[b];
+        Flatness_Buffer[frames_collected] = flatness;
+        frames_collected++;
+        if (frames_collected == 40) buffer_ready = true;
+    } else {
+        for (int f = 1; f < 40; f++) {
+            for (int j = 0; j < 13; j++) MFCC_Buffer[f-1][j] = MFCC_Buffer[f][j];
+            ZCR_Buffer[f-1] = ZCR_Buffer[f];
+            RMS_Buffer[f-1] = RMS_Buffer[f];
+            for (int b = 0; b < 7; b++) Contrast_Buffer[f-1][b] = Contrast_Buffer[f][b];
+            Flatness_Buffer[f-1] = Flatness_Buffer[f];
+        }
+        for (int j = 0; j < 13; j++) MFCC_Buffer[39][j] = MFCC_Coeff[j];
+        ZCR_Buffer[39] = zcr;
+        RMS_Buffer[39] = rms;
+        for (int b = 0; b < 7; b++) Contrast_Buffer[39][b] = contrast[b];
+        Flatness_Buffer[39] = flatness;
+
+        buildFeaturesBuffer();
+        runInference();
+    }
+}

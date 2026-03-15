@@ -1,0 +1,198 @@
+/* Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+
+#include "model.h"
+#include "inference.h"
+#include <Arduino.h>
+
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#define NUM_CLASSES 6
+
+
+// Globals, used for compatibility with Arduino-style sketches.
+namespace {
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* model_input = nullptr;
+
+// Create an area of memory to use for input, output, and intermediate arrays.
+// The size of this will depend on the model you're using, and may need to be
+// determined by experimentation.
+constexpr int kTensorArenaSize = 19 * 1024;
+// Keep aligned to 16 bytes for CMSIS
+alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+float* model_input_buffer = nullptr;
+}  // namespace
+
+extern float Features_Buffer[40][49];
+
+// The name of this function is important for Arduino compatibility.
+void setupModel() {
+  tflite::InitializeTarget();
+
+  // Map the model into a usable data structure. This doesn't involve any
+  // copying or parsing, it's a very lightweight operation.
+  model = tflite::GetModel(audio_model_int8_tflite);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    error_reporter->Report(
+        "Model provided is schema version %d not equal "
+        "to supported version %d.",
+        model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  // Pull in only the operation implementations we need.
+  // This relies on a complete list of all the ops needed by this graph.
+  // An easier approach is to just use the AllOpsResolver, but this will
+  // incur some penalty in code space for op implementations that are not
+  // needed by this graph.
+  //
+  // tflite::AllOpsResolver resolver;
+  // NOLINTNEXTLINE(runtime-global-variables)
+
+
+  // Model in python for reference
+    // model = Sequential([
+    //     Conv1D(64, 3, activation='relu', input_shape=(40, 39)),
+    //     MaxPooling1D(2),
+    //     Conv1D(128, 3, activation='relu'),
+    //     GlobalAveragePooling1D(),
+    //     Dense(64, activation='relu'),
+    //     Dense(6, activation='softmax')
+    // ])
+
+  static tflite::MicroMutableOpResolver<10> micro_op_resolver;
+  if (micro_op_resolver.AddConv2D() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddMaxPool2D() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddMean() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddRelu() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddFullyConnected() != kTfLiteOk) {
+    return;
+  }
+  if (micro_op_resolver.AddSoftmax() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddReshape() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddExpandDims() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddQuantize() != kTfLiteOk) {
+    return;
+  }
+
+  if (micro_op_resolver.AddDequantize() != kTfLiteOk) {
+    return;
+  }
+
+  // Build an interpreter to run the model with.
+  static tflite::MicroInterpreter static_interpreter(
+      model, micro_op_resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+
+  // Allocate memory from the tensor_arena for the model's tensors.
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    error_reporter->Report("AllocateTensors() failed");
+    return;
+  }
+
+  // Get information about the memory area to use for the model's input.
+  model_input = interpreter->input(0);
+  Serial.print("dims->size: "); Serial.println(model_input->dims->size);
+  for (int i = 0; i < model_input->dims->size; i++) {
+    Serial.print("dim "); Serial.print(i); Serial.print(": ");
+    Serial.println(model_input->dims->data[i]);
+  }
+  Serial.print("type: "); Serial.println(model_input->type);
+  if ((model_input->dims->size != 3) || (model_input->dims->data[0] != 1) ||
+      (model_input->dims->data[1] != 40) || (model_input->dims->data[2] != 49) ||
+      (model_input->type != kTfLiteFloat32)) {
+    error_reporter->Report("Bad input tensor parameters in model");
+    return;
+  }
+  model_input_buffer = model_input->data.f;
+
+
+  error_reporter->Report("Initialization complete");
+}
+
+void runInference() {
+
+    for (int i = 0; i < 40; i++) {
+        for (int j = 0; j < 49; j++) {
+            model_input->data.f[i*49 + j] = Features_Buffer[i][j];
+        }
+    }
+
+    if (interpreter == nullptr) {
+        Serial.println("Interpreter is null!");
+        return;
+    }
+
+    TfLiteStatus invoke = interpreter->Invoke();
+
+    if (invoke != kTfLiteOk) {
+        error_reporter->Report("Invoke() failed");
+        return;
+    }
+
+    TfLiteTensor* output = interpreter->output(0);
+
+    const char* CLASS_NAMES[NUM_CLASSES] = {
+        "baby_cry", "doorbell", "microwave", "music", "smoke_alarm", "speech"
+    };
+
+    float max_val = -1.0f;
+    int outputclass = 0;
+    for (int i = 0; i < NUM_CLASSES; i++) {
+        Serial.print(CLASS_NAMES[i]);
+        Serial.print(": ");
+        Serial.print(output->data.f[i], 3);
+        Serial.print("  ");
+        if (output->data.f[i] > max_val) {
+            max_val = output->data.f[i];
+            outputclass = i;
+        }
+    }
+    Serial.println();
+    Serial.print(">> ");
+    Serial.println(CLASS_NAMES[outputclass]);
+}
